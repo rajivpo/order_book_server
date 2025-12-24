@@ -3,7 +3,7 @@ use crate::{
     listeners::{directory::DirectoryListener, order_book::state::OrderBookState},
     order_book::{
         Coin, Snapshot,
-        multi_book::{Snapshots, load_snapshots_from_json},
+        multi_book::{Snapshots, load_snapshots_from_str},
     },
     prelude::*,
     types::{
@@ -118,9 +118,28 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                 }
             }
             _ = ticker.tick() => {
-                let listener = listener.clone();
-                let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
-                fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
+                let should_fetch = {
+                    let mut guard = listener.lock().await;
+                    let in_progress = guard.snapshot_in_progress();
+                    let backlog_pairs = guard.backlog_len_pairs();
+
+                    if in_progress {
+                        info!("obs_l4_snapshot_skip reason=in_progress");
+                        false
+                    } else if backlog_pairs > 5 {
+                        info!("obs_l4_snapshot_skip reason=high_backlog backlog={}", backlog_pairs);
+                        false
+                    } else {
+                        guard.set_snapshot_in_progress(true);
+                        true
+                    }
+                };
+
+                if should_fetch {
+                    let listener = listener.clone();
+                    let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
+                    fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
+                }
             }
             () = sleep(Duration::from_secs(5)) => {
                 let listener = listener.lock().await;
@@ -147,7 +166,19 @@ fn fetch_snapshot(
                     listener.begin_caching();
                     listener.clone_state()
                 };
-                let snapshot = load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&output_fln).await;
+                // Read file async, then parse on blocking threadpool to avoid blocking async runtime
+                let file_contents = match tokio::fs::read_to_string(&output_fln).await {
+                    Ok(contents) => contents,
+                    Err(err) => {
+                        listener.lock().await.set_snapshot_in_progress(false);
+                        return Err::<(), Error>(err.into());
+                    }
+                };
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&file_contents)
+                })
+                .await
+                .map_err(|e| Error::from(e.to_string()))?;
                 info!("Snapshot fetched");
                 // sleep to let some updates build up.
                 sleep(Duration::from_secs(1)).await;
@@ -163,24 +194,36 @@ fn fetch_snapshot(
                                 if let Some((order_statuses, order_diffs)) = cache.pop_front() {
                                     state.apply_updates(order_statuses, order_diffs)?;
                                 } else {
+                                    listener.lock().await.set_snapshot_in_progress(false);
                                     return Err::<(), Error>("Not enough cached updates".into());
                                 }
                             }
                             if state.height() > height {
+                                listener.lock().await.set_snapshot_in_progress(false);
                                 return Err("Fetched snapshot lagging stored state".into());
                             }
                             let stored_snapshot = state.compute_snapshot().snapshot;
                             info!("Validating snapshot");
-                            validate_snapshot_consistency(&stored_snapshot, expected_snapshot, ignore_spot)
+                            let result = validate_snapshot_consistency(&stored_snapshot, expected_snapshot, ignore_spot);
+                            listener.lock().await.set_snapshot_in_progress(false);
+                            result
                         } else {
-                            listener.lock().await.init_from_snapshot(expected_snapshot, height);
+                            let mut guard = listener.lock().await;
+                            guard.init_from_snapshot(expected_snapshot, height);
+                            guard.set_snapshot_in_progress(false);
                             Ok(())
                         }
                     }
-                    Err(err) => Err(err),
+                    Err(err) => {
+                        listener.lock().await.set_snapshot_in_progress(false);
+                        Err(err)
+                    }
                 }
             }
-            Err(err) => Err(err),
+            Err(err) => {
+                listener.lock().await.set_snapshot_in_progress(false);
+                Err(err)
+            }
         };
         let _unused = tx.send(res);
         Ok(())
@@ -200,6 +243,7 @@ pub(crate) struct OrderBookListener {
     // Only Some when we want it to collect updates
     fetched_snapshot_cache: Option<VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)>>,
     internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
+    snapshot_in_progress: bool,
 }
 
 impl OrderBookListener {
@@ -215,7 +259,20 @@ impl OrderBookListener {
             internal_message_tx,
             order_diff_cache: BatchQueue::new(),
             order_status_cache: BatchQueue::new(),
+            snapshot_in_progress: false,
         }
+    }
+
+    pub(crate) const fn snapshot_in_progress(&self) -> bool {
+        self.snapshot_in_progress
+    }
+
+    pub(crate) fn set_snapshot_in_progress(&mut self, in_progress: bool) {
+        self.snapshot_in_progress = in_progress;
+    }
+
+    pub(crate) fn backlog_len_pairs(&self) -> usize {
+        self.order_diff_cache.len().min(self.order_status_cache.len())
     }
 
     fn clone_state(&self) -> Option<OrderBookState> {
@@ -419,7 +476,7 @@ impl DirectoryListener for OrderBookListener {
                     error!(
                         "{event_source} serialization error {err}, height: {:?}, line: {:?}",
                         self.order_book_state.as_ref().map(OrderBookState::height),
-                        &line[..100],
+                        &line[..line.len().min(100)],
                     );
                     #[allow(clippy::unwrap_used)]
                     let total_len: i64 = total_len.try_into().unwrap();

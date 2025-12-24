@@ -152,4 +152,8 @@ impl<T> BatchQueue<T> {
     pub(super) fn front(&self) -> Option<&Batch<T>> {
         self.deque.front()
     }
+
+    pub(super) fn len(&self) -> usize {
+        self.deque.len()
+    }
 }
