@@ -118,27 +118,8 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                 }
             }
             _ = ticker.tick() => {
-                let should_fetch = {
-                    let mut guard = listener.lock().await;
-                    let in_progress = guard.snapshot_in_progress();
-                    let backlog_pairs = guard.backlog_len_pairs();
-
-                    if in_progress {
-                        info!("obs_l4_snapshot_skip reason=in_progress");
-                        false
-                    } else if backlog_pairs > 5 {
-                        info!("obs_l4_snapshot_skip reason=high_backlog backlog={}", backlog_pairs);
-                        false
-                    } else {
-                        guard.set_snapshot_in_progress(true);
-                        true
-                    }
-                };
-
-                if should_fetch {
-                    let listener = listener.clone();
-                    let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
-                    fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
+                if listener.lock().await.try_start_snapshot() {
+                    fetch_snapshot(dir.clone(), listener.clone(), snapshot_fetch_task_tx.clone(), ignore_spot);
                 }
             }
             () = sleep(Duration::from_secs(5)) => {
@@ -157,77 +138,55 @@ fn fetch_snapshot(
     tx: UnboundedSender<Result<()>>,
     ignore_spot: bool,
 ) {
-    let tx = tx.clone();
     tokio::spawn(async move {
-        let res = match process_rmp_file(&dir).await {
-            Ok(output_fln) => {
-                let state = {
-                    let mut listener = listener.lock().await;
-                    listener.begin_caching();
-                    listener.clone_state()
-                };
-                // Read file async, then parse on blocking threadpool to avoid blocking async runtime
-                let file_contents = match tokio::fs::read_to_string(&output_fln).await {
-                    Ok(contents) => contents,
-                    Err(err) => {
-                        listener.lock().await.set_snapshot_in_progress(false);
-                        return Err::<(), Error>(err.into());
-                    }
-                };
-                let snapshot = tokio::task::spawn_blocking(move || {
-                    load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&file_contents)
-                })
-                .await
-                .map_err(|e| Error::from(e.to_string()))?;
-                info!("Snapshot fetched");
-                // sleep to let some updates build up.
-                sleep(Duration::from_secs(1)).await;
-                let mut cache = {
-                    let mut listener = listener.lock().await;
-                    listener.take_cache()
-                };
-                info!("Cache has {} elements", cache.len());
-                match snapshot {
-                    Ok((height, expected_snapshot)) => {
-                        if let Some(mut state) = state {
-                            while state.height() < height {
-                                if let Some((order_statuses, order_diffs)) = cache.pop_front() {
-                                    state.apply_updates(order_statuses, order_diffs)?;
-                                } else {
-                                    listener.lock().await.set_snapshot_in_progress(false);
-                                    return Err::<(), Error>("Not enough cached updates".into());
-                                }
-                            }
-                            if state.height() > height {
-                                listener.lock().await.set_snapshot_in_progress(false);
-                                return Err("Fetched snapshot lagging stored state".into());
-                            }
-                            let stored_snapshot = state.compute_snapshot().snapshot;
-                            info!("Validating snapshot");
-                            let result = validate_snapshot_consistency(&stored_snapshot, expected_snapshot, ignore_spot);
-                            listener.lock().await.set_snapshot_in_progress(false);
-                            result
-                        } else {
-                            let mut guard = listener.lock().await;
-                            guard.init_from_snapshot(expected_snapshot, height);
-                            guard.set_snapshot_in_progress(false);
-                            Ok(())
-                        }
-                    }
-                    Err(err) => {
-                        listener.lock().await.set_snapshot_in_progress(false);
-                        Err(err)
-                    }
-                }
-            }
-            Err(err) => {
-                listener.lock().await.set_snapshot_in_progress(false);
-                Err(err)
-            }
-        };
+        let res = fetch_snapshot_inner(&dir, &listener, ignore_spot).await;
+        listener.lock().await.set_snapshot_in_progress(false);
         let _unused = tx.send(res);
-        Ok(())
     });
+}
+
+async fn fetch_snapshot_inner(
+    dir: &PathBuf,
+    listener: &Arc<Mutex<OrderBookListener>>,
+    ignore_spot: bool,
+) -> Result<()> {
+    let output_fln = process_rmp_file(dir).await?;
+    let state = {
+        let mut guard = listener.lock().await;
+        guard.begin_caching();
+        guard.clone_state()
+    };
+
+    // Read file async, then parse on blocking threadpool to avoid blocking async runtime
+    let file_contents = tokio::fs::read_to_string(&output_fln).await?;
+    let (height, expected_snapshot) = tokio::task::spawn_blocking(move || {
+        load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&file_contents)
+    })
+    .await
+    .map_err(|e| Error::from(e.to_string()))??;
+
+    info!("Snapshot fetched");
+    sleep(Duration::from_secs(1)).await;
+
+    let mut cache = listener.lock().await.take_cache();
+    info!("Cache has {} elements", cache.len());
+
+    let Some(mut state) = state else {
+        listener.lock().await.init_from_snapshot(expected_snapshot, height);
+        return Ok(());
+    };
+
+    while state.height() < height {
+        let (order_statuses, order_diffs) = cache.pop_front().ok_or("Not enough cached updates")?;
+        state.apply_updates(order_statuses, order_diffs)?;
+    }
+
+    if state.height() > height {
+        return Err("Fetched snapshot lagging stored state".into());
+    }
+
+    info!("Validating snapshot");
+    validate_snapshot_consistency(&state.compute_snapshot().snapshot, expected_snapshot, ignore_spot)
 }
 
 pub(crate) struct OrderBookListener {
@@ -263,16 +222,26 @@ impl OrderBookListener {
         }
     }
 
-    pub(crate) const fn snapshot_in_progress(&self) -> bool {
-        self.snapshot_in_progress
-    }
-
-    pub(crate) fn set_snapshot_in_progress(&mut self, in_progress: bool) {
+    fn set_snapshot_in_progress(&mut self, in_progress: bool) {
         self.snapshot_in_progress = in_progress;
     }
 
-    pub(crate) fn backlog_len_pairs(&self) -> usize {
+    fn backlog_len_pairs(&self) -> usize {
         self.order_diff_cache.len().min(self.order_status_cache.len())
+    }
+
+    fn try_start_snapshot(&mut self) -> bool {
+        if self.snapshot_in_progress {
+            info!("obs_l4_snapshot_skip reason=in_progress");
+            return false;
+        }
+        let backlog = self.backlog_len_pairs();
+        if backlog > 5 {
+            info!("obs_l4_snapshot_skip reason=high_backlog backlog={}", backlog);
+            return false;
+        }
+        self.snapshot_in_progress = true;
+        true
     }
 
     fn clone_state(&self) -> Option<OrderBookState> {
